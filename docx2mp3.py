@@ -6,10 +6,11 @@ is skipped, and each paragraph is voiced in Korean or English depending on its
 script. Headings become MP3 chapter markers.
 
 Engines:
-  edge    Microsoft Edge neural voices via `edge-tts` (natural; needs network access
-          to speech.platform.bing.com)
-  espeak  espeak-ng (offline; robotic but always available)
-  auto    edge if reachable, otherwise espeak (default)
+  supertonic  Supertone Supertonic neural TTS, run locally with ONNX Runtime
+              (natural; downloads the model from huggingface.co on first use)
+  edge        Microsoft Edge neural voices via `edge-tts` (needs speech.platform.bing.com)
+  espeak      espeak-ng (offline; robotic but always available)
+  auto        supertonic if installed, otherwise espeak (default)
 """
 import argparse
 import asyncio
@@ -34,6 +35,11 @@ EDGE_VOICES = {"ko": "ko-KR-SunHiNeural", "en": "en-US-AriaNeural"}
 ESPEAK_VOICES = {"ko": "ko", "en": "en-us"}
 SAMPLE_RATE = 24000
 MAX_CHUNK = 1500
+KO_LETTERS = dict(zip(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    ["에이", "비", "씨", "디", "이", "에프", "지", "에이치", "아이", "제이", "케이", "엘", "엠",
+     "엔", "오", "피", "큐", "알", "에스", "티", "유", "브이", "더블유", "엑스", "와이", "지"],
+))
 
 
 def detect_lang(text):
@@ -48,6 +54,23 @@ def normalize(text):
     text = re.sub(r"<(표|그림)\s*(\d+)>", r"\1 \2.", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def speakable(text, lang):
+    """Rewrite symbols and acronyms the neural voices tend to misread."""
+    unit = "달러" if lang == "ko" else " dollars"
+    text = re.sub(r"\$\s?(\d[\d,]*(?:\.\d+)?)", lambda m: m.group(1) + unit, text)
+    text = text.replace("·", ", ").replace("→", ", ")
+    if lang == "ko":
+        text = re.sub(r"(?<![A-Za-z])TV(?![A-Za-z])", "티비", text)
+        # Spell upper-case acronyms (ECM, ODM, SER-M, LG) with Korean letter names.
+        text = re.sub(
+            r"(?<![A-Za-z])[A-Z]{2,}(?:-[A-Z]+)?(?![a-z])",
+            lambda m: " ".join("".join(KO_LETTERS[c] for c in part)
+                               for part in m.group(0).split("-")),
+            text,
+        )
+    return text
 
 
 def table_text(table):
@@ -117,6 +140,34 @@ def synth_espeak(text, lang, out_wav, rate):
     os.remove(raw)
 
 
+_SUPERTONIC = None
+
+
+def synth_supertonic(text, lang, out_wav, voice, speed):
+    global _SUPERTONIC
+    if _SUPERTONIC is None:
+        from supertonic import TTS
+
+        tts = TTS(auto_download=True)
+        _SUPERTONIC = (tts, {})
+    tts, styles = _SUPERTONIC
+    if voice not in styles:
+        styles[voice] = tts.get_voice_style(voice_name=voice)
+    wav, _ = tts.synthesize(text, voice_style=styles[voice], lang=lang, speed=speed)
+    raw = out_wav + ".raw.wav"
+    tts.save_audio(wav, raw)
+    to_wav(raw, out_wav)
+    os.remove(raw)
+
+
+def supertonic_available():
+    try:
+        import supertonic  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 async def _edge_save(text, voice, out, rate):
     import edge_tts
 
@@ -164,7 +215,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="input .docx file")
     ap.add_argument("output", nargs="?", help="output .mp3 (default: input name with .mp3)")
-    ap.add_argument("--engine", choices=["auto", "edge", "espeak"], default="auto")
+    ap.add_argument("--engine", choices=["auto", "supertonic", "edge", "espeak"], default="auto")
+    ap.add_argument("--voice", default="F1", help="supertonic voice: F1-F5, M1-M5")
+    ap.add_argument("--speed", type=float, default=1.05, help="supertonic speed (1.0 = normal)")
     ap.add_argument("--edge-rate", default="+0%", help="edge-tts speed, e.g. +10%%")
     ap.add_argument("--espeak-rate", type=int, default=165, help="espeak-ng words per minute")
     ap.add_argument("--workers", type=int, default=4)
@@ -174,18 +227,18 @@ def main():
     output = args.output or os.path.splitext(args.input)[0] + ".mp3"
     engine = args.engine
     if engine == "auto":
-        engine = "edge" if edge_available() else "espeak"
+        engine = "supertonic" if supertonic_available() else "espeak"
     print(f"engine: {engine}", file=sys.stderr)
 
     segments = extract_segments(args.input)
     if args.text_out:
         with open(args.text_out, "w", encoding="utf-8") as f:
-            f.write("\n".join(t for t, _ in segments) + "\n")
+            f.write("\n".join(speakable(t, detect_lang(t)) for t, _ in segments) + "\n")
 
     jobs = []  # (text, lang, heading_title or None)
     for text, is_heading in segments:
         lang = detect_lang(text)
-        for i, chunk in enumerate(split_chunks(text)):
+        for i, chunk in enumerate(split_chunks(speakable(text, lang))):
             jobs.append((chunk, lang, text if is_heading and i == 0 else None))
 
     work = tempfile.mkdtemp(prefix="docx2mp3_")
@@ -193,13 +246,17 @@ def main():
         def run(idx):
             text, lang, _ = jobs[idx]
             out = os.path.join(work, f"{idx:05d}.wav")
-            if engine == "edge":
+            if engine == "supertonic":
+                synth_supertonic(text, lang, out, args.voice, args.speed)
+            elif engine == "edge":
                 synth_edge(text, lang, out, args.edge_rate)
             else:
                 synth_espeak(text, lang, out, args.espeak_rate)
             return out
 
-        with ThreadPoolExecutor(args.workers) as pool:
+        # Supertonic already uses every core through ONNX Runtime.
+        workers = 1 if engine == "supertonic" else args.workers
+        with ThreadPoolExecutor(workers) as pool:
             wavs = []
             for n, wav in enumerate(pool.map(run, range(len(jobs))), 1):
                 wavs.append(wav)

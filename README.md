@@ -10,16 +10,17 @@ Word(.docx) 문서 전체를 소리 내어 읽는 MP3 한 개로 변환합니다
 
 ```bash
 pip install -r requirements.txt
-sudo apt-get install -y ffmpeg espeak-ng   # espeak-ng은 오프라인 엔진용
+sudo apt-get install -y ffmpeg              # espeak-ng는 선택(오프라인 예비 엔진)
 ```
 
 ## 사용
 
 ```bash
-python3 docx2mp3.py 문서.docx 결과.mp3                 # auto: edge 가능하면 edge, 아니면 espeak
-python3 docx2mp3.py 문서.docx 결과.mp3 --engine edge   # 자연스러운 신경망 음성 (네트워크 필요)
+python3 docx2mp3.py 문서.docx 결과.mp3                 # auto: supertonic 설치돼 있으면 사용, 아니면 espeak
+python3 docx2mp3.py 문서.docx --voice M1 --speed 1.1  # supertonic 목소리(F1~F5, M1~M5)와 속도
 python3 docx2mp3.py 문서.docx 결과.mp3 --engine espeak # 오프라인 음성
 python3 docx2mp3.py 문서.docx --edge-rate +15% --text-out 읽은내용.txt
 ```
 
-`edge` 엔진은 `speech.platform.bing.com`에 접속할 수 있어야 합니다.
+기본 엔진인 Supertonic(신경망 음성)은 처음 실행할 때 huggingface.co에서 모델을 내려받고, 이후에는 CPU에서 로컬로 합성합니다.
+`$299.99`는 "299.99달러"로, 한국어 문단의 대문자 약어(ECM, ODM)는 "이씨엠", "오디엠"처럼 읽도록 바꿔서 합성합니다.
