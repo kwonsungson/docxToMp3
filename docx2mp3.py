@@ -30,7 +30,10 @@ from docx.text.paragraph import Paragraph
 HANGUL = re.compile(r"[가-힣]")
 SKIP_STYLES = ("toc",)
 SKIP_TEXTS = {"목차", "표목차", "그림목차", "Contents", "Table of Contents"}
-HEADING_STYLES = ("Heading 1", "Heading 2", "목차 제목")
+PART_STYLES = ("Heading 1", "목차 제목")  # start a new file with --split-dir
+CHAPTER_STYLES = ("Heading 2",)
+PART_TEXTS = {"참고문헌", "References"}
+ROMAN = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
 EDGE_VOICES = {"ko": "ko-KR-SunHiNeural", "en": "en-US-AriaNeural"}
 ESPEAK_VOICES = {"ko": "ko", "en": "en-us"}
 SAMPLE_RATE = 24000
@@ -43,8 +46,8 @@ KO_LETTERS = dict(zip(
 
 
 def detect_lang(text):
-    letters = sum(c.isalpha() for c in text) or 1
-    return "ko" if len(HANGUL.findall(text)) / letters > 0.15 else "en"
+    # Any Hangul means Korean: Korean paragraphs often carry English terms in parentheses.
+    return "ko" if HANGUL.search(text) else "en"
 
 
 def normalize(text):
@@ -61,6 +64,11 @@ def speakable(text, lang):
     unit = "달러" if lang == "ko" else " dollars"
     text = re.sub(r"\$\s?(\d[\d,]*(?:\.\d+)?)", lambda m: m.group(1) + unit, text)
     text = text.replace("·", ", ").replace("→", ", ")
+    roman = "|".join(sorted(ROMAN, key=len, reverse=True))
+    chapter = (lambda n: f"제{n}장") if lang == "ko" else (lambda n: f"Chapter {n}")
+    # Chapter numbers: "II. 이론적 배경" -> "제2장. 이론적 배경", "제 IV장" -> "제4장".
+    text = re.sub(rf"^({roman})\.\s", lambda m: chapter(ROMAN[m.group(1)]) + ". ", text)
+    text = re.sub(rf"제\s?({roman})\s?장", lambda m: f"제{ROMAN[m.group(1)]}장", text)
     if lang == "ko":
         text = re.sub(r"(?<![A-Za-z])TV(?![A-Za-z])", "티비", text)
         # Spell upper-case acronyms (ECM, ODM, SER-M, LG) with Korean letter names.
@@ -91,7 +99,7 @@ def table_text(table):
 
 
 def extract_segments(path):
-    """Return a list of (text, is_heading) in document order."""
+    """Return a list of (text, kind) in document order; kind is "part", "chapter" or None."""
     document = docx.Document(path)
     segments = []
     for el in document.element.body:
@@ -102,9 +110,15 @@ def extract_segments(path):
                 continue
             text = normalize(p.text)
             if text and text not in SKIP_TEXTS:
-                segments.append((text, style in HEADING_STYLES))
+                if style in PART_STYLES or text in PART_TEXTS:
+                    kind = "part"
+                elif style in CHAPTER_STYLES:
+                    kind = "chapter"
+                else:
+                    kind = None
+                segments.append((text, kind))
         elif el.tag == qn("w:tbl"):
-            segments.extend((line, False) for line in table_text(Table(el, document)))
+            segments.extend((line, None) for line in table_text(Table(el, document)))
     return segments
 
 
@@ -211,6 +225,36 @@ def duration(path):
     return float(out.stdout.strip())
 
 
+def assemble(items, output, work, short_gap, long_gap):
+    """Concatenate synthesized chunks into one chaptered MP3; return its length in seconds."""
+    base = os.path.splitext(os.path.basename(output))[0]
+    concat = os.path.join(work, f"list_{base}.txt")
+    meta_path = os.path.join(work, f"meta_{base}.txt")
+    chapters, t = [], 0.0
+    with open(concat, "w") as f:
+        for (_, _, heading, _), wav, d in items:
+            if heading:
+                f.write(f"file '{long_gap}'\n")
+                t += 1.2
+                chapters.append((t, heading))
+            f.write(f"file '{wav}'\nfile '{long_gap if heading else short_gap}'\n")
+            t += d + (1.2 if heading else 0.5)
+    meta = [";FFMETADATA1", f"title={base}"]
+    ends = [c[0] for c in chapters[1:]] + [t]
+    for (start, title), end in zip(chapters, ends):
+        meta += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={int(start * 1000)}",
+                 f"END={int(end * 1000)}", f"title={title[:120]}"]
+    with open(meta_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(meta) + "\n")
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", concat,
+         "-i", meta_path, "-map_metadata", "1", "-map_chapters", "1",
+         "-c:a", "libmp3lame", "-b:a", "64k", "-id3v2_version", "3", output],
+        check=True,
+    )
+    return t
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="input .docx file")
@@ -221,6 +265,7 @@ def main():
     ap.add_argument("--edge-rate", default="+0%", help="edge-tts speed, e.g. +10%%")
     ap.add_argument("--espeak-rate", type=int, default=165, help="espeak-ng words per minute")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--split-dir", help="also write one MP3 per part (Heading 1 / summary / references)")
     ap.add_argument("--text-out", help="also write the text that is read aloud to this file")
     args = ap.parse_args()
 
@@ -235,16 +280,17 @@ def main():
         with open(args.text_out, "w", encoding="utf-8") as f:
             f.write("\n".join(speakable(t, detect_lang(t)) for t, _ in segments) + "\n")
 
-    jobs = []  # (text, lang, heading_title or None)
-    for text, is_heading in segments:
+    jobs = []  # (text, lang, heading_title or None, kind or None)
+    for text, kind in segments:
         lang = detect_lang(text)
         for i, chunk in enumerate(split_chunks(speakable(text, lang))):
-            jobs.append((chunk, lang, text if is_heading and i == 0 else None))
+            first = kind and i == 0
+            jobs.append((chunk, lang, text if first else None, kind if first else None))
 
     work = tempfile.mkdtemp(prefix="docx2mp3_")
     try:
         def run(idx):
-            text, lang, _ = jobs[idx]
+            text, lang, _, _ = jobs[idx]
             out = os.path.join(work, f"{idx:05d}.wav")
             if engine == "supertonic":
                 synth_supertonic(text, lang, out, args.voice, args.speed)
@@ -266,41 +312,20 @@ def main():
         short_gap, long_gap = os.path.join(work, "gap_s.wav"), os.path.join(work, "gap_l.wav")
         silence(short_gap, 0.5)
         silence(long_gap, 1.2)
+        durations = [duration(w) for w in wavs]
+        items = list(zip(jobs, wavs, durations))
 
-        concat = os.path.join(work, "list.txt")
-        meta = [";FFMETADATA1", f"title={os.path.splitext(os.path.basename(output))[0]}"]
-        t = 0.0
-        with open(concat, "w") as f:
-            for (text, _, heading), wav in zip(jobs, wavs):
-                gap = long_gap if heading else short_gap
-                if heading:
-                    f.write(f"file '{long_gap}'\n")
-                    t += 1.2
-                    start = t
-                f.write(f"file '{wav}'\nfile '{gap}'\n")
-                d = duration(wav)
-                if heading:
-                    meta += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={int(start * 1000)}",
-                             f"END={int((start + d) * 1000)}", f"title={heading[:120]}"]
-                t += d + (1.2 if heading else 0.5)
-        # Extend each chapter to the start of the next one.
-        starts = [int(l.split("=")[1]) for l in meta if l.startswith("START=")]
-        ends = starts[1:] + [int(t * 1000)]
-        k = 0
-        for i, line in enumerate(meta):
-            if line.startswith("END="):
-                meta[i] = f"END={ends[k]}"
-                k += 1
-        meta_path = os.path.join(work, "meta.txt")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(meta) + "\n")
-
-        subprocess.run(
-            ["ffmpeg", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", concat,
-             "-i", meta_path, "-map_metadata", "1", "-map_chapters", "1",
-             "-c:a", "libmp3lame", "-b:a", "64k", "-id3v2_version", "3", output],
-            check=True,
-        )
+        t = assemble(items, output, work, short_gap, long_gap)
+        if args.split_dir:
+            os.makedirs(args.split_dir, exist_ok=True)
+            starts = [i for i, ((_, _, h, kind), _, _) in enumerate(items) if kind == "part"]
+            starts = [0] + [i for i in starts if i > 0]
+            for n, (a, b) in enumerate(zip(starts, starts[1:] + [len(items)]), 1):
+                title = next((h for (_, _, h, k), _, _ in items[a:b] if k == "part"), "part")
+                name = re.sub(r"[^\w가-힣]+", "_", title).strip("_")[:60]
+                path = os.path.join(args.split_dir, f"{n:02d}_{name}.mp3")
+                d = assemble(items[a:b], path, work, short_gap, long_gap)
+                print(f"  {path} ({d / 60:.1f} min)", file=sys.stderr)
         print(f"wrote {output} ({t / 60:.1f} min)", file=sys.stderr)
     finally:
         shutil.rmtree(work, ignore_errors=True)

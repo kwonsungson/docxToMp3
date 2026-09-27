@@ -19,7 +19,8 @@ sudo apt-get install -y ffmpeg              # espeak-ng는 선택(오프라인 �
 python3 docx2mp3.py 문서.docx 결과.mp3                 # auto: supertonic 설치돼 있으면 사용, 아니면 espeak
 python3 docx2mp3.py 문서.docx --voice M1 --speed 1.1  # supertonic 목소리(F1~F5, M1~M5)와 속도
 python3 docx2mp3.py 문서.docx 결과.mp3 --engine espeak # 오프라인 음성
-python3 docx2mp3.py 문서.docx --edge-rate +15% --text-out 읽은내용.txt
+python3 docx2mp3.py 문서.docx 결과.mp3 --split-dir parts   # 요약·장(Heading 1)·참고문헌별 파일도 따로 저장
+python3 docx2mp3.py 문서.docx --text-out 읽은내용.txt
 ```
 
 기본 엔진인 Supertonic(신경망 음성)은 처음 실행할 때 huggingface.co에서 모델을 내려받고, 이후에는 CPU에서 로컬로 합성합니다.
