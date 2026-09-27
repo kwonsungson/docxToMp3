@@ -33,6 +33,7 @@ SKIP_TEXTS = {"목차", "표목차", "그림목차", "Contents", "Table of Conte
 PART_STYLES = ("Heading 1", "목차 제목")  # start a new file with --split-dir
 CHAPTER_STYLES = ("Heading 2",)
 PART_TEXTS = {"참고문헌", "References"}
+KO_NUMS = dict(enumerate("영일이삼사오육칠팔구십"))
 ROMAN = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
 EDGE_VOICES = {"ko": "ko-KR-SunHiNeural", "en": "en-US-AriaNeural"}
 ESPEAK_VOICES = {"ko": "ko", "en": "en-us"}
@@ -65,10 +66,11 @@ def speakable(text, lang):
     text = re.sub(r"\$\s?(\d[\d,]*(?:\.\d+)?)", lambda m: m.group(1) + unit, text)
     text = text.replace("·", ", ").replace("→", ", ")
     roman = "|".join(sorted(ROMAN, key=len, reverse=True))
-    chapter = (lambda n: f"제{n}장") if lang == "ko" else (lambda n: f"Chapter {n}")
-    # Chapter numbers: "II. 이론적 배경" -> "제2장. 이론적 배경", "제 IV장" -> "제4장".
+    # Chapter numbers: "II. 이론적 배경" -> "제이장. 이론적 배경", "제 IV장" -> "제사장".
+    # Hangul numerals, because the voice reads "제2장" as "제 두장".
+    chapter = (lambda n: f"제{KO_NUMS[n]}장") if lang == "ko" else (lambda n: f"Chapter {n}")
     text = re.sub(rf"^({roman})\.\s", lambda m: chapter(ROMAN[m.group(1)]) + ". ", text)
-    text = re.sub(rf"제\s?({roman})\s?장", lambda m: f"제{ROMAN[m.group(1)]}장", text)
+    text = re.sub(rf"제\s?({roman})\s?장", lambda m: f"제{KO_NUMS[ROMAN[m.group(1)]]}장", text)
     if lang == "ko":
         text = re.sub(r"(?<![A-Za-z])TV(?![A-Za-z])", "티비", text)
         # Spell upper-case acronyms (ECM, ODM, SER-M, LG) with Korean letter names.
@@ -319,7 +321,7 @@ def main():
         if args.split_dir:
             os.makedirs(args.split_dir, exist_ok=True)
             starts = [i for i, ((_, _, h, kind), _, _) in enumerate(items) if kind == "part"]
-            starts = [0] + [i for i in starts if i > 0]
+            starts = [0] + starts[1:]  # the cover page joins the first part
             for n, (a, b) in enumerate(zip(starts, starts[1:] + [len(items)]), 1):
                 title = next((h for (_, _, h, k), _, _ in items[a:b] if k == "part"), "part")
                 name = re.sub(r"[^\w가-힣]+", "_", title).strip("_")[:60]
